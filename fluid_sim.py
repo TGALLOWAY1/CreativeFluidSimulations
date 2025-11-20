@@ -20,10 +20,10 @@ damp = 0.985           # Density decay (faster decay when music stops)
 # Tunable parameters (will be controlled by GUI sliders)
 density_multiplier = 0.15      # Overall density scale
 music_responsiveness = 1.0     # How much smoke responds to music (0-2)
-bass_speed_multiplier = 40.0   # How much bass affects speed
-base_flow_speed = 3.0          # Base upward velocity
+bass_speed_multiplier =90.0   # How much bass affects speed
+base_flow_speed = 6.0          # Base upward velocity
 
-AUDIO_FILE = "TestSong.wav" # <--- PUT YOUR SONG HERE
+AUDIO_FILE = "REF SONGS/TestSong.wav" # <--- PUT YOUR SONG HERE
 
 # =============================================================================
 # 2. DATA FIELDS (The Grid)
@@ -109,6 +109,55 @@ def apply_impulse(vf: ti.template(), df: ti.template(),
             df[i, j] += d_val * falloff
 
 @ti.kernel
+def apply_fanned_emission(vf: ti.template(), df: ti.template(),
+                          x: float, y: float,
+                          r: float, base_speed: float, bass_boost: float,
+                          pan: float, spread_width: float, d_val: float):
+    """Emits smoke with variable angles to create a fan pattern"""
+    for i, j in vf:
+        dx = i - x * RES
+        dy = j - y * RES
+        dist2 = dx*dx + dy*dy
+        
+        if dist2 < (r * RES)**2:
+            falloff = ti.exp(-dist2 / (r * RES))
+            
+            # Calculate angle for this cell based on horizontal position
+            # Cells to the left get negative angles, right get positive
+            # Use dx to determine the angle offset from center
+            max_dist = r * RES
+            if max_dist > 0:
+                # Normalize horizontal position (-1 to +1) based on radius
+                normalized_x = dx / max_dist
+                # Clamp to prevent extreme angles
+                normalized_x = ti.max(-1.0, ti.min(1.0, normalized_x))
+                
+                # Pan shifts the center direction
+                pan_offset = pan * (spread_width * 0.4)
+                # Each cell gets an angle based on its position
+                # Use full spread_width range for maximum fan effect
+                cell_angle = pan_offset + (normalized_x * spread_width * 0.5)
+                
+                # Add pseudo-random variation using cell indices for natural spread
+                # Use hash of cell position for deterministic but varied angles
+                hash_val = float((i * 73856093) ^ (j * 19349663)) * 0.000001
+                hash_val = hash_val - int(hash_val)  # Get fractional part (0-1)
+                random_variation = (hash_val - 0.5) * spread_width * 0.2
+                total_angle = cell_angle + random_variation
+                
+                # Convert angle to velocity components
+                angle_rad = total_angle * 3.14159 / 180.0  # degrees to radians
+                speed = base_speed + bass_boost
+                
+                # Calculate velocity with proper fanning
+                # Make horizontal component much stronger for visible fan
+                v_x = ti.sin(angle_rad) * speed * 1.2  # Much stronger horizontal
+                v_y = ti.cos(angle_rad) * speed  # Vertical component
+                
+                vf[i, j] += ti.Vector([v_x, v_y]) * falloff
+                df[i, j] += d_val * falloff
+
+@ti.kernel
 def compute_divergence(vf: ti.template(), div: ti.template()):
     """Calculate how much fluid is entering/leaving each cell."""
     for i, j in vf:
@@ -189,9 +238,17 @@ class AudioAnalyzer:
             
             # Load audio data for analysis
             self.fs, self.data = wavfile.read(filepath)
+            # Preserve stereo channels for stereo spread analysis
             if len(self.data.shape) > 1:
-                self.data = self.data.mean(axis=1) # Convert to mono
+                self.stereo_data = self.data.copy()  # Keep stereo for spread analysis
+                self.data = self.data.mean(axis=1) # Convert to mono for frequency analysis
+            else:
+                self.stereo_data = np.column_stack([self.data, self.data])  # Duplicate for mono files
             self.data = self.data / np.max(np.abs(self.data)) # Normalize
+            # Normalize stereo data
+            max_val = np.max(np.abs(self.stereo_data))
+            if max_val > 0:
+                self.stereo_data = self.stereo_data / max_val
             
             # Load and play audio with pygame Sound (better WAV support)
             self.sound = pygame.mixer.Sound(filepath)
@@ -216,31 +273,35 @@ class AudioAnalyzer:
         self.last_idx = 0
         self.bass_history = []
         self.treble_history = []
+        self.stereo_spread_history = []
+        self.current_pan = 0.0  # Current pan position (-1 to +1)
         # Track max values for adaptive normalization
         self.max_bass = 0.0
         self.max_treble = 0.0
+        self.max_stereo_spread = 0.0
         
     def get_energy(self):
         if not self.has_audio:
             # Mock beat if no audio
             t = time.time() - self.start_time
-            return (np.sin(t * 10) > 0.8) * 0.8, 0.0
+            return (np.sin(t * 10) > 0.8) * 0.8, 0.0, 0.0, 0.0
         
         # Track playback time manually (Sound objects don't have get_pos())
         current_time = time.time() - self.start_time
         
         # Check if audio has finished playing
         if current_time >= self.audio_length:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
         
         idx = int(current_time * self.fs)
         
         # Larger window for better frequency resolution
         window = 4096
         if idx + window >= len(self.data):
-            return 0.0, 0.0 # End of song
+            return 0.0, 0.0, 0.0, 0.0 # End of song
             
         chunk = self.data[idx:idx+window]
+        stereo_chunk = self.stereo_data[idx:idx+window] if idx + window < len(self.stereo_data) else self.stereo_data[idx:]
         
         # Calculate RMS (overall loudness) for beat detection
         rms = np.sqrt(np.mean(chunk**2))
@@ -282,15 +343,53 @@ class AudioAnalyzer:
         bass_smoothed = np.mean(self.bass_history) if self.bass_history else bass_raw
         treble_smoothed = np.mean(self.treble_history) if self.treble_history else high_raw
         
+        # Calculate stereo spread (left vs right channel difference)
+        if len(stereo_chunk.shape) > 1 and stereo_chunk.shape[1] >= 2:
+            left_channel = stereo_chunk[:, 0]
+            right_channel = stereo_chunk[:, 1]
+            
+            # Calculate RMS for each channel
+            left_rms = np.sqrt(np.mean(left_channel**2))
+            right_rms = np.sqrt(np.mean(right_channel**2))
+            
+            # Stereo spread: difference between channels normalized by total energy
+            total_energy = left_rms + right_rms
+            if total_energy > 0:
+                # Pan value: -1 (fully left) to +1 (fully right)
+                pan = (right_rms - left_rms) / total_energy
+                # Spread: how much difference (0 = mono, 1 = fully panned)
+                stereo_spread_raw = abs(pan)
+                # Store pan for angle calculation
+                self.current_pan = pan
+            else:
+                stereo_spread_raw = 0.0
+                self.current_pan = 0.0
+        else:
+            stereo_spread_raw = 0.0
+            self.current_pan = 0.0
+        
+        # Track max stereo spread
+        if stereo_spread_raw > self.max_stereo_spread:
+            self.max_stereo_spread = stereo_spread_raw
+        
+        # Store history for smoothing
+        self.stereo_spread_history.append(stereo_spread_raw)
+        if len(self.stereo_spread_history) > 3:
+            self.stereo_spread_history.pop(0)
+        
+        stereo_spread_smoothed = np.mean(self.stereo_spread_history) if self.stereo_spread_history else stereo_spread_raw
+        
         # Normalize using adaptive scaling (use max seen so far, with minimum threshold)
         # This prevents everything from capping at 1.0
         bass_scale = max(self.max_bass, 0.1)  # Minimum scale to prevent division issues
         treble_scale = max(self.max_treble, 0.1)
+        stereo_scale = max(self.max_stereo_spread, 0.01)
         
         bass_energy = min(bass_smoothed / bass_scale, 1.0)
         high_energy = min(treble_smoothed / treble_scale, 1.0)
+        stereo_spread = min(stereo_spread_smoothed / stereo_scale, 1.0)
         
-        return bass_energy, high_energy
+        return bass_energy, high_energy, stereo_spread, self.current_pan
     
     def stop(self):
         """Stop audio playback"""
@@ -307,8 +406,10 @@ class AudioAnalyzer:
             self.start_time = time.time()
             self.bass_history = []
             self.treble_history = []
+            self.stereo_spread_history = []
             self.max_bass = 0.0
             self.max_treble = 0.0
+            self.max_stereo_spread = 0.0
             print("Audio restarted")
     
     def pause(self):
@@ -330,11 +431,11 @@ def main():
     audio = AudioAnalyzer(AUDIO_FILE)
     
     # Tunable parameters (will be controlled by sliders)
-    density_mult = 0.15
+    density_mult = 0.5
     music_resp = 1.0
-    bass_speed = 40.0
+    bass_speed = 100.0
     base_speed = 3.0
-    decay_rate = 0.985
+    decay_rate = 0.99
     
     print("Starting simulation... (Press ESC to exit)")
     print("Keyboard Controls:")
@@ -359,7 +460,7 @@ def main():
                     density_mult = max(0.0, density_mult - 0.01)
                     print(f"Density: {density_mult:.3f}")
                 elif e.key == 'a':
-                    density_mult = min(0.5, density_mult + 0.01)
+                    density_mult = min(1.0, density_mult + 0.01)
                     print(f"Density: {density_mult:.3f}")
                 elif e.key == 'w':
                     music_resp = max(0.0, music_resp - 0.1)
@@ -380,10 +481,10 @@ def main():
                     decay_rate = min(0.999, decay_rate + 0.002)
                     print(f"Decay Rate: {decay_rate:.4f}")
                 elif e.key == 't':
-                    density_mult = 0.15
+                    density_mult = 0.5
                     music_resp = 1.0
-                    bass_speed = 40.0
-                    decay_rate = 0.985
+                    bass_speed = 100.0
+                    decay_rate = 0.99
                     print("Reset to defaults")
                 elif e.key == 'h':
                     show_controls = not show_controls
@@ -419,11 +520,11 @@ def main():
                 continue
             
             # 1. Get Audio Data
-            bass, treble = audio.get_energy()
+            bass, treble, stereo_spread, pan = audio.get_energy()
             
             # Debug output every 60 frames (~1 second at 60fps)
             if frame_count % 60 == 0:
-                print(f"Bass: {bass:.3f}, Treble: {treble:.3f}, Density: {density_mult:.3f}, Resp: {music_resp:.3f}")
+                print(f"Bass: {bass:.3f}, Treble: {treble:.3f}, Stereo: {stereo_spread:.3f}, Density: {density_mult:.3f}, Resp: {music_resp:.3f}")
             frame_count += 1
             
             # 2. Apply Inputs
@@ -440,26 +541,37 @@ def main():
                 # Apply music responsiveness multiplier
                 responsive_bass = bass * music_resp
                 responsive_treble = treble * music_resp
+                responsive_stereo = stereo_spread * music_resp
                 
                 # Velocity (Upward Force)
                 base_flow_y = base_speed
                 bass_boost_y = responsive_bass * bass_speed
                 
-                # Add horizontal variation that responds to treble
-                noise_x = (np.random.rand() - 0.5) * (5.0 + responsive_treble * 10.0)
+                # Emission angle system: stereo controls spread width, pan controls direction
+                # Base spread: always some diffusion (minimum 30 degrees for visible fan)
+                base_spread = 30.0  # Minimum spread in degrees - much more visible
                 
-                v_x = noise_x
-                v_y = base_flow_y + bass_boost_y
+                # Stereo spread controls the total width of the emission cone
+                # At max stereo (1.0), spread reaches 60 degrees total (±30 degrees)
+                # At min stereo (0.0), spread is still base_spread for visible fan
+                max_spread_angle = 60.0  # Maximum total spread - wider fan
+                spread_width = base_spread + (responsive_stereo * (max_spread_angle - base_spread))
                 
-                # Density (Amount of Smoke) - Much lower base values
+                # Density (Amount of Smoke)
                 base_density = 0.01
                 d_val = (base_density + (responsive_bass * 0.3) + (responsive_treble * 0.15)) * density_mult
                 
                 # Dynamic Radius - expands with bass
                 radius = 0.03 + (responsive_bass * 0.05)
-
-                apply_impulse(velocity, density, source_x, source_y, 
-                              radius, v_x, v_y, d_val)
+                
+                # Debug: print spread info occasionally
+                if frame_count % 60 == 0:
+                    print(f"Spread width: {spread_width:.1f}°, Pan: {pan:.3f}, Stereo: {stereo_spread:.3f}")
+                
+                # Use fanned emission kernel that varies angle per cell
+                apply_fanned_emission(velocity, density, source_x, source_y,
+                                     radius, base_flow_y, bass_boost_y,
+                                     pan, spread_width, d_val)
 
             # 3. Physics Steps
             # Advect Velocity
@@ -492,7 +604,7 @@ def main():
                 gui.text("Music Resp: {:.2f} (W/S)".format(music_resp), (0.01, 0.92), font_size=15, color=0xFFFFFF)
                 gui.text("Bass Speed: {:.1f} (E/D)".format(bass_speed), (0.01, 0.89), font_size=15, color=0xFFFFFF)
                 gui.text("Decay: {:.4f} (R/F)".format(decay_rate), (0.01, 0.86), font_size=15, color=0xFFFFFF)
-                gui.text("Bass: {:.3f} Treble: {:.3f}".format(bass, treble), (0.01, 0.83), font_size=15, color=0x00FFFF)
+                gui.text("Bass: {:.3f} Treble: {:.3f} Stereo: {:.3f}".format(bass, treble, stereo_spread), (0.01, 0.83), font_size=15, color=0x00FFFF)
                 gui.text("SPACE: Restart | P: Pause | H: Toggle Help", (0.01, 0.80), font_size=15, color=0xFFFF00)
             
             gui.show()

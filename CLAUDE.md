@@ -2,87 +2,112 @@
 
 ## Project Overview
 
-Audio-reactive fluid simulation that visualizes music as animated smoke/fluid using the **Stable Fluids** algorithm. A single-file Python application (`fluid_sim.py`) running GPU-accelerated physics via Taichi with real-time audio analysis.
+**Frequency Towers** — A music-reactive fluid visualization where 5 separate smoke towers each react to a different instrument stem (kick, bass, snare, hats, vocal). Built on the Stable Fluids algorithm with GPU-accelerated physics via Taichi. Each tower has unique colors, physics behaviors, and force types. A single-file Python application (`fluid_sim.py`).
 
 ## Tech Stack
 
 - **Taichi** — GPU-accelerated physics kernels (auto-detects CUDA, Metal, Vulkan)
-- **Pygame** — Audio playback and GUI windowing
-- **NumPy** — Audio data processing
-- **SciPy** — FFT frequency analysis and WAV file I/O
+- **Pygame** — Audio playback, display windowing, and UI rendering
+- **NumPy** — Audio data processing and image conversion
+- **SciPy** — WAV file I/O
 - **Python 3** — No version pinned; uses modern syntax
 
 ## Repository Structure
 
 ```
 ├── fluid_sim.py         # Entire application (single file)
-├── README.md            # Minimal readme with screenshot
+├── STEMS/               # Audio stems directory (one WAV per tower)
+│   ├── kick.wav         # Kick drum stem
+│   ├── bass.wav         # Bass stem
+│   ├── snare.wav        # Snare drum stem
+│   ├── hats.wav         # Hi-hats stem
+│   └── vocal.wav        # Vocal stem
+├── README.md            # Readme with screenshot
 ├── CLAUDE.md            # This file
 ├── REF IMAGES/          # Visual style references (Ferrofluid, Fire, Nebula)
-└── REF SONGS/           # Test audio (TestSong.wav, 44100 Hz stereo)
+└── REF SONGS/           # Original test audio
 ```
 
 ## Architecture of fluid_sim.py
 
-The file is organized into four sections:
+The file is organized into six sections:
 
-1. **Configuration (top)** — Grid resolution (512×512), physics constants (`dt`, Jacobi iterations, decay rates), tunable parameters (`density_multiplier`, `music_responsiveness`, `bass_speed_multiplier`)
-2. **Taichi Fields & GPU Kernels** — Velocity, density, pressure fields; kernels for advection, impulse injection, fanned emission, pressure solving, and rendering
-3. **AudioAnalyzer class** — Loads WAV files, runs streaming FFT (4096-sample window), extracts bass (40–200 Hz), treble (2–10 kHz), stereo spread, and pan with adaptive normalization and 3-frame smoothing
-4. **Main loop** — GUI setup, keyboard input handling, audio energy → physics forces pipeline, render cycle
+1. **Configuration (top)** — Grid resolution (1280×720), tower definitions (name, color, x_pos, physics params), global tunable parameters
+2. **Data Fields** — Taichi fields: shared velocity (2D vector), per-tower density (5-component vector), pressure/divergence, pixel buffer, tower parameter fields for GPU access
+3. **Physics Kernels** — GPU kernels for advection, per-tower emission (5 force types), pressure solving, and per-tower color rendering
+4. **Audio System** — `StemAnalyzer` (single stem RMS + transient detection), `MultiStemAnalyzer` (synchronized multi-channel playback)
+5. **Camera System** — `Camera` class with kick-triggered shake effect
+6. **Main Loop** — Pygame display, event handling, audio → physics → render pipeline
+
+### Tower Configuration
+
+| Tower | Color | Force Type | Behavior |
+|-------|-------|------------|----------|
+| Kick | Orange | Impulse | Strong upward burst on transients |
+| Bass | Red | Slow push | Heavy continuous upward flow |
+| Snare | Blue | Radial | Outward burst on transients |
+| Hats | Cyan | Noise | Chaotic random turbulence |
+| Vocal | Purple | Attractor | Smooth flow with centering |
 
 ### Physics Pipeline (per frame)
 
 ```
-Audio energy → Apply fanned emission → Advect velocity → Advect density
-→ Compute divergence → Pressure solve (40 Jacobi iterations) → Subtract gradient → Render
+Audio stems → RMS + transient per tower → Apply tower emissions (5 force types)
+→ Advect velocity → Advect tower density (per-tower dissipation)
+→ Compute divergence → Pressure solve (40 Jacobi iterations)
+→ Subtract gradient → Render (per-tower color, additive blending) → Pygame display
 ```
 
 ### Key Patterns
 
 - `@ti.kernel` / `@ti.func` decorators mark GPU code — these cannot use Python stdlib
 - `_new_*` prefixed fields are double-buffer temporaries
-- Semi-Lagrangian advection with bilinear interpolation for stability
-- Gaussian falloff for force/density injection
-- Color mapping uses density thresholds (0.3, 0.7) for dark blue → cyan palette
+- `tower_density` is a 5-component vector field — one component per tower, advected together
+- `ti.static(range(NUM_TOWERS))` unrolls tower loops at compile time for per-tower force type branching
+- Tower parameters stored in Taichi fields for GPU kernel access
+- Additive color blending in render kernel allows natural tower overlap
+- Camera shake applied via sample coordinate offset in render kernel
 
 ## Running the Project
 
 ```bash
-# Install dependencies (no requirements.txt exists yet)
+# Install dependencies
 pip install taichi pygame numpy scipy
+
+# Place audio stems in STEMS/ directory
+# Expected: kick.wav, bass.wav, snare.wav, hats.wav, vocal.wav
 
 # Run the simulation
 python fluid_sim.py
 ```
 
-Requires a WAV file at `REF SONGS/TestSong.wav` for audio input. The simulation opens a 512×512 GUI window.
+The simulation opens a 1280×720 pygame window. Towers emit ambient smoke even without stem files.
 
 ### Interactive Controls
 
 | Key | Action |
 |-----|--------|
-| Q/A | Increase/decrease density multiplier |
-| W/S | Increase/decrease music responsiveness |
-| E/D | Increase/decrease bass speed multiplier |
-| R/F | Increase/decrease decay rate |
+| Q/A | Decrease/increase density multiplier |
+| W/S | Decrease/increase music responsiveness |
+| R/F | Decrease/increase velocity decay |
 | T | Reset all parameters to defaults |
 | Space | Restart audio/animation |
 | P | Pause/unpause |
-| H | Toggle on-screen help overlay |
+| H | Toggle on-screen HUD overlay |
+| ESC | Quit |
 
 ## Development Conventions
 
 ### Code Style
 
 - **snake_case** for functions and variables, **CamelCase** for classes
-- Configuration constants at the top of the file, not scattered
+- Configuration constants and tower definitions at the top of the file
 - Sectional headers with `=====` separators and numbered comments
 - Physics concepts explained in inline comments/docstrings
 
 ### Branching
 
-- `Phase-1-Stable-Fluids-Attempt-1` — Main development branch
+- `main` — Main branch
 - Feature branches as needed
 
 ### What's Not Set Up
@@ -95,8 +120,9 @@ Requires a WAV file at `REF SONGS/TestSong.wav` for audio input. The simulation 
 ## Guidelines for AI Assistants
 
 - This is a **single-file project** — all code lives in `fluid_sim.py`. Do not split it into modules unless explicitly asked.
-- Taichi kernel code (`@ti.kernel`, `@ti.func`) has restrictions: no Python objects, no dynamic allocation, limited control flow. Test changes carefully.
-- Audio parameters are tuned for the specific WAV test file. Changes to frequency bands or normalization can drastically alter the visual output.
+- Taichi kernel code (`@ti.kernel`, `@ti.func`) has restrictions: no Python objects, no dynamic allocation, no `continue`/`break` in `ti.static` loops. Use nested `if` blocks instead. Test changes carefully.
+- The 5-component `tower_density` vector field is advected as a single unit. Per-tower dissipation is applied component-wise in `advect_tower_density_k`.
+- Tower parameters are stored in both Python dicts (`TOWER_CONFIG`) and Taichi fields (suffixed `_f`). Always update both if changing tower config.
 - The physics simulation is sensitive to parameter values — small changes to `dt`, decay rates, or Jacobi iterations can cause instability or visual artifacts.
-- Reference images in `REF IMAGES/` show the target aesthetic (cosmic, liquid metal, fire). Keep visual changes aligned with this direction.
-- The `REF SONGS/` directory contains a large WAV file (~21 MB) — do not re-add or duplicate it in commits.
+- Reference images in `REF IMAGES/` show the target aesthetic. Keep visual changes aligned with this direction.
+- The `STEMS/` and `REF SONGS/` directories contain large WAV files — do not commit them.

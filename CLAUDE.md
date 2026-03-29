@@ -27,15 +27,16 @@ Audio-reactive fluid simulation that visualizes music as animated smoke/fluid us
 The file is organized into four sections:
 
 1. **Configuration (top)** — Grid resolution (512×512), physics constants (`dt`, Jacobi iterations, decay rates), tunable parameters (`density_multiplier`, `music_responsiveness`, `bass_speed_multiplier`)
-2. **Taichi Fields & GPU Kernels** — Velocity, density, pressure fields; kernels for advection, impulse injection, fanned emission, pressure solving, and rendering
-3. **AudioAnalyzer class** — Loads WAV files, runs streaming FFT (4096-sample window), extracts bass (40–200 Hz), treble (2–10 kHz), stereo spread, and pan with adaptive normalization and 3-frame smoothing
+2. **Taichi Fields & GPU Kernels** — Velocity, density, pressure fields; kernels for advection, impulse injection, fanned emission, shockwave, edge turbulence, pressure solving, and rendering
+3. **AudioAnalyzer class** — Loads WAV files, runs streaming FFT (4096-sample window), extracts bass (40–200 Hz), treble (2–10 kHz), stereo spread, pan, and transient onset detection with adaptive normalization and 2-frame bass smoothing
 4. **Main loop** — GUI setup, keyboard input handling, audio energy → physics forces pipeline, render cycle
 
 ### Physics Pipeline (per frame)
 
 ```
-Audio energy → Apply fanned emission → Advect velocity → Advect density
-→ Compute divergence → Pressure solve (40 Jacobi iterations) → Subtract gradient → Render
+Audio energy → Apply fanned emission → Shockwave (if transient) → Edge turbulence (if treble)
+→ Advect velocity → Advect density → Compute divergence → Pressure solve (40 Jacobi iterations)
+→ Subtract gradient → Render
 ```
 
 ### Key Patterns
@@ -45,6 +46,8 @@ Audio energy → Apply fanned emission → Advect velocity → Advect density
 - Semi-Lagrangian advection with bilinear interpolation for stability
 - Gaussian falloff for force/density injection
 - Color mapping uses density thresholds (0.3, 0.7) for dark blue → cyan palette
+- `apply_shockwave` — expanding ring of outward velocity triggered by kick/snare transients (onset detection)
+- `apply_edge_turbulence` — high-frequency pseudo-random velocity perturbations at density gradient boundaries, driven by treble energy
 
 ## Running the Project
 

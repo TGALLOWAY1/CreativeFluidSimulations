@@ -158,6 +158,57 @@ def apply_fanned_emission(vf: ti.template(), df: ti.template(),
                 df[i, j] += d_val * falloff
 
 @ti.kernel
+def apply_shockwave(vf: ti.template(), cx: float, cy: float,
+                    strength: float, ring_radius: float, ring_width: float):
+    """Radial outward velocity burst — expanding ring that pushes existing smoke."""
+    for i, j in vf:
+        dx = float(i) - cx * RES
+        dy = float(j) - cy * RES
+        dist = ti.sqrt(dx * dx + dy * dy)
+
+        # Ring-shaped Gaussian falloff: peaks at ring_radius, decays with ring_width
+        ring_factor = ti.exp(-((dist - ring_radius) ** 2) / (2.0 * ring_width * ring_width))
+
+        if dist > 0.5 and ring_factor > 0.01:
+            # Radial outward direction
+            nx = dx / dist
+            ny = dy / dist
+            push = strength * ring_factor
+            vf[i, j] += ti.Vector([nx, ny]) * push
+
+@ti.kernel
+def apply_edge_turbulence(vf: ti.template(), df: ti.template(),
+                          treble_strength: float, time_seed: int):
+    """Inject high-frequency velocity perturbations at smoke edges (density gradients)."""
+    for i, j in vf:
+        if i < 2 or i >= RES - 2 or j < 2 or j >= RES - 2:
+            continue
+
+        # Density gradient magnitude — identifies smoke edges
+        dx_grad = df[i + 1, j] - df[i - 1, j]
+        dy_grad = df[i, j + 1] - df[i, j - 1]
+        grad_mag = ti.sqrt(dx_grad * dx_grad + dy_grad * dy_grad)
+
+        if grad_mag > 0.01:
+            # Spatial hash for pseudo-random direction (deterministic per cell)
+            hash1 = float((i * 73856093) ^ (j * 19349663)) * 0.0000001
+            hash1 = hash1 - ti.floor(hash1)
+            hash2 = float((i * 83492791) ^ (j * 47420677)) * 0.0000001
+            hash2 = hash2 - ti.floor(hash2)
+
+            # Time-varying hash for sizzle — changes every frame
+            t_hash = float((time_seed * 12345) ^ (i * 7919) ^ (j * 6271)) * 0.0000001
+            t_hash = t_hash - ti.floor(t_hash)
+
+            # Combine spatial + temporal randomness for rapidly changing perturbation
+            perturb_x = (hash1 + t_hash - 1.0) * 2.0
+            perturb_y = (hash2 + t_hash - 1.0) * 2.0
+
+            # Scale by gradient magnitude (edges only) and treble energy
+            scale = grad_mag * treble_strength
+            vf[i, j] += ti.Vector([perturb_x, perturb_y]) * scale
+
+@ti.kernel
 def compute_divergence(vf: ti.template(), div: ti.template()):
     """Calculate how much fluid is entering/leaving each cell."""
     for i, j in vf:
@@ -279,26 +330,29 @@ class AudioAnalyzer:
         self.max_bass = 0.0
         self.max_treble = 0.0
         self.max_stereo_spread = 0.0
+        # Transient/onset detection (unsmoothed frame-to-frame delta)
+        self.prev_bass_raw = 0.0
+        self.max_bass_delta = 0.0
         
     def get_energy(self):
         if not self.has_audio:
             # Mock beat if no audio
             t = time.time() - self.start_time
-            return (np.sin(t * 10) > 0.8) * 0.8, 0.0, 0.0, 0.0
+            return (np.sin(t * 10) > 0.8) * 0.8, 0.0, 0.0, 0.0, 0.0
         
         # Track playback time manually (Sound objects don't have get_pos())
         current_time = time.time() - self.start_time
         
         # Check if audio has finished playing
         if current_time >= self.audio_length:
-            return 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
         
         idx = int(current_time * self.fs)
         
         # Larger window for better frequency resolution
         window = 4096
         if idx + window >= len(self.data):
-            return 0.0, 0.0, 0.0, 0.0 # End of song
+            return 0.0, 0.0, 0.0, 0.0, 0.0 # End of song
             
         chunk = self.data[idx:idx+window]
         stereo_chunk = self.stereo_data[idx:idx+window] if idx + window < len(self.stereo_data) else self.stereo_data[idx:]
@@ -318,7 +372,13 @@ class AudioAnalyzer:
         bass_mean = np.mean(bass_spectrum) if len(bass_spectrum) > 0 else 0.0
         # Combine peak and mean (reduced multipliers to prevent capping)
         bass_raw = (bass_peak * 0.7 + bass_mean * 0.3) * 2.0 + rms * 1.5
-        
+
+        # Transient detection: unsmoothed frame-to-frame increase (bypasses smoothing)
+        bass_delta = max(0.0, bass_raw - self.prev_bass_raw)
+        self.prev_bass_raw = bass_raw
+        if bass_delta > self.max_bass_delta:
+            self.max_bass_delta = bass_delta
+
         # Treble Range (2000Hz - 10000Hz) - for hi-hats and cymbals
         high_mask = (freqs >= 2000) & (freqs <= 10000)
         high_spectrum = spectrum[high_mask] if np.any(high_mask) else np.array([0.0])
@@ -335,8 +395,9 @@ class AudioAnalyzer:
         # Store history for smoothing
         self.bass_history.append(bass_raw)
         self.treble_history.append(high_raw)
-        if len(self.bass_history) > 3:
+        if len(self.bass_history) > 2:
             self.bass_history.pop(0)
+        if len(self.treble_history) > 3:
             self.treble_history.pop(0)
         
         # Use recent average for smoother response
@@ -388,8 +449,12 @@ class AudioAnalyzer:
         bass_energy = min(bass_smoothed / bass_scale, 1.0)
         high_energy = min(treble_smoothed / treble_scale, 1.0)
         stereo_spread = min(stereo_spread_smoothed / stereo_scale, 1.0)
-        
-        return bass_energy, high_energy, stereo_spread, self.current_pan
+
+        # Normalize transient (unsmoothed, raw spike for kick punch)
+        transient_scale = max(self.max_bass_delta, 0.1)
+        transient = min(bass_delta / transient_scale, 1.0)
+
+        return bass_energy, high_energy, stereo_spread, self.current_pan, transient
     
     def stop(self):
         """Stop audio playback"""
@@ -410,6 +475,8 @@ class AudioAnalyzer:
             self.max_bass = 0.0
             self.max_treble = 0.0
             self.max_stereo_spread = 0.0
+            self.prev_bass_raw = 0.0
+            self.max_bass_delta = 0.0
             print("Audio restarted")
     
     def pause(self):
@@ -437,6 +504,16 @@ def main():
     base_speed = 3.0
     decay_rate = 0.99
     
+    # Shockwave state (triggered by kick/snare transients)
+    shockwave_active = False
+    shockwave_radius = 0.0
+    shockwave_strength = 0.0
+    SHOCKWAVE_THRESHOLD = 0.4
+    SHOCKWAVE_INITIAL_STRENGTH = 25.0
+    SHOCKWAVE_EXPAND_SPEED = 8.0
+    SHOCKWAVE_RING_WIDTH = 15.0
+    SHOCKWAVE_DECAY = 0.85
+
     print("Starting simulation... (Press ESC to exit)")
     print("Keyboard Controls:")
     print("  Q/A: Decrease/Increase Density Multiplier")
@@ -507,6 +584,9 @@ def main():
                     divergence.fill(0.0)
                     frame_count = 0
                     paused = False
+                    shockwave_active = False
+                    shockwave_radius = 0.0
+                    shockwave_strength = 0.0
                     print("Animation and song restarted!")
             
             # Skip simulation if paused
@@ -520,7 +600,7 @@ def main():
                 continue
             
             # 1. Get Audio Data
-            bass, treble, stereo_spread, pan = audio.get_energy()
+            bass, treble, stereo_spread, pan, transient = audio.get_energy()
             
             # Debug output every 60 frames (~1 second at 60fps)
             if frame_count % 60 == 0:
@@ -557,12 +637,12 @@ def main():
                 max_spread_angle = 60.0  # Maximum total spread - wider fan
                 spread_width = base_spread + (responsive_stereo * (max_spread_angle - base_spread))
                 
-                # Density (Amount of Smoke)
+                # Density (Amount of Smoke) — transient adds brightness flash on kicks
                 base_density = 0.01
-                d_val = (base_density + (responsive_bass * 0.3) + (responsive_treble * 0.15)) * density_mult
-                
-                # Dynamic Radius - expands with bass
-                radius = 0.03 + (responsive_bass * 0.05)
+                d_val = (base_density + (responsive_bass * 0.3) + (responsive_treble * 0.15) + transient * 0.5) * density_mult
+
+                # Dynamic Radius - expands with bass + transient spike
+                radius = 0.03 + (responsive_bass * 0.05) + (transient * 0.04)
                 
                 # Debug: print spread info occasionally
                 if frame_count % 60 == 0:
@@ -572,6 +652,24 @@ def main():
                 apply_fanned_emission(velocity, density, source_x, source_y,
                                      radius, base_flow_y, bass_boost_y,
                                      pan, spread_width, d_val)
+
+            # Shockwave: radial pressure wave on kick/snare transients
+            if transient > SHOCKWAVE_THRESHOLD and not shockwave_active:
+                shockwave_active = True
+                shockwave_radius = 0.0
+                shockwave_strength = SHOCKWAVE_INITIAL_STRENGTH * transient
+
+            if shockwave_active:
+                shockwave_radius += SHOCKWAVE_EXPAND_SPEED
+                apply_shockwave(velocity, 0.5, 0.02,
+                                shockwave_strength, shockwave_radius, SHOCKWAVE_RING_WIDTH)
+                shockwave_strength *= SHOCKWAVE_DECAY
+                if shockwave_strength < 0.5:
+                    shockwave_active = False
+
+            # Treble edge turbulence: sizzle at smoke boundaries
+            if treble > 0.1:
+                apply_edge_turbulence(velocity, density, treble * 8.0, frame_count)
 
             # 3. Physics Steps
             # Advect Velocity

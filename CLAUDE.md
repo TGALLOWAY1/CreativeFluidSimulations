@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**Frequency Towers** — A music-reactive fluid visualization where 5 separate smoke towers each react to a different instrument stem (kick, bass, snare, hats, vocal). Built on the Stable Fluids algorithm with GPU-accelerated physics via Taichi. Each tower has unique colors, physics behaviors, and force types. A single-file Python application (`fluid_sim.py`).
+**Frequency Towers** — A music-reactive fluid visualization where 5 separate smoke towers each react to a different instrument stem (kick, bass, snare, hats, instruments). Built on the Stable Fluids algorithm with GPU-accelerated physics via Taichi. Each tower has unique colors, physics behaviors, and force types. A single-file Python application (`fluid_sim.py`).
 
 ## Tech Stack
 
@@ -21,7 +21,7 @@
 │   ├── bass.wav         # Bass stem
 │   ├── snare.wav        # Snare drum stem
 │   ├── hats.wav         # Hi-hats stem
-│   └── vocal.wav        # Vocal stem
+│   └── instruments.wav  # Instruments stem
 ├── README.md            # Readme with screenshot
 ├── CLAUDE.md            # This file
 ├── REF IMAGES/          # Visual style references (Ferrofluid, Fire, Nebula)
@@ -47,7 +47,7 @@ The file is organized into six sections:
 | Bass | Red | Slow push | Heavy continuous upward flow |
 | Snare | Blue | Radial | Outward burst on transients |
 | Hats | Cyan | Noise | Chaotic random turbulence |
-| Vocal | Purple | Attractor | Smooth flow with centering |
+| Instruments | Purple | Attractor | Smooth flow with centering |
 
 ### Physics Pipeline (per frame)
 
@@ -75,7 +75,7 @@ Audio stems → RMS + transient per tower → Apply tower emissions (5 force typ
 pip install taichi pygame numpy scipy
 
 # Place audio stems in STEMS/ directory
-# Expected: kick.wav, bass.wav, snare.wav, hats.wav, vocal.wav
+# Expected: kick.wav, bass.wav, snare.wav, hats.wav, instruments.wav
 
 # Run the simulation
 python fluid_sim.py

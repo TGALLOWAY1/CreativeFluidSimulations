@@ -59,8 +59,8 @@ TOWER_CONFIG = [
         "radius": 0.016,
         "spread": 30.0,
     },
-    {   # VOCAL — Smooth flowing motion with centering
-        "name": "vocal",
+    {   # INSTRUMENTS — Smooth flowing motion with centering
+        "name": "instruments",
         "color": (0.6, 0.15, 0.9),     # Purple
         "x_pos": 0.88,
         "density_scale": 0.7,
@@ -257,7 +257,7 @@ def apply_tower_emissions(frame: int, density_mult: float, music_resp: float):
                         vy = (h2 - 0.3) * noise_str + energy * v_scale * 5.0
                         d_val = energy * d_scale * 0.06 * density_mult
 
-                    # ---- VOCAL: Smooth flow with gentle centering ----
+                    # ---- INSTRUMENTS: Smooth flow with gentle centering ----
                     elif t == 4:
                         smooth_v = energy * v_scale * 8.0
                         center_pull = -dx * 0.015 * energy

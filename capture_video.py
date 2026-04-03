@@ -34,7 +34,7 @@ bass_speed_multiplier = 90.0
 base_flow_speed = 6.0
 
 AUDIO_FILE = "REF SONGS/TestSong.wav"
-CAPTURE_DURATION = 30  # seconds
+CAPTURE_DURATION = 55  # seconds (full audio length)
 FPS = 30
 OUTPUT_FILE = "simulation_output.mp4"
 
